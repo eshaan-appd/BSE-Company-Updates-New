@@ -237,12 +237,15 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
                                    end_yyyymmdd: str,
                                    verbose: bool = True,
                                    request_timeout: int = 25) -> pd.DataFrame:
-    """Fetches raw announcements, then filters:
+    """Fetches raw announcements across a date range by looping day-by-day, then filters:
     Category='Company Update' AND subcategory contains any:
     Acquisition | Amalgamation / Merger | Scheme of Arrangement | Joint Venture
+
+    NOTE: No deduplication; results from each day are appended as-is.
     """
     assert len(start_yyyymmdd) == 8 and len(end_yyyymmdd) == 8
     assert start_yyyymmdd <= end_yyyymmdd
+
     base_page = "https://www.bseindia.com/corporates/ann.html"
     url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
 
@@ -269,40 +272,66 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
         {"subcategory": "",   "strSearch": ""},
     ]
 
+    # --- NEW: loop day-by-day and append results (no deduplication) ---
+    from datetime import datetime, timedelta
+
+    start_dt = datetime.strptime(start_yyyymmdd, "%Y%m%d").date()
+    end_dt   = datetime.strptime(end_yyyymmdd, "%Y%m%d").date()
+
     all_rows = []
-    for v in variants:
-        params = {
-            "pageno": 1, "strCat": "-1", "subcategory": v["subcategory"],
-            "strPrevDate": start_yyyymmdd, "strToDate": end_yyyymmdd,
-            "strSearch": v["strSearch"], "strscrip": "", "strType": "C",
-        }
-        rows, total, page = [], None, 1
-        while True:
-            r = s.get(url, params=params, timeout=request_timeout)
-            ct = r.headers.get("content-type","")
-            if "application/json" not in ct:
-                if verbose: st.warning(f"[variant {v}] non-JSON on page {page} (ct={ct}).")
+    cur = start_dt
+    while cur <= end_dt:
+        day_str = cur.strftime("%Y%m%d")
+        day_rows = []  # keep rows for this specific day
+
+        for v in variants:
+            params = {
+                "pageno": 1, "strCat": "-1", "subcategory": v["subcategory"],
+                "strPrevDate": day_str, "strToDate": day_str,  # per-day window
+                "strSearch": v["strSearch"], "strscrip": "", "strType": "C",
+            }
+            rows, total, page = [], None, 1
+            while True:
+                r = s.get(url, params=params, timeout=request_timeout)
+                ct = r.headers.get("content-type","")
+                if "application/json" not in ct:
+                    if verbose:
+                        try:
+                            st.warning(f"[{day_str} variant {v}] non-JSON on page {page} (ct={ct}).")
+                        except Exception:
+                            pass
+                    break
+                data = r.json()
+                table = data.get("Table") or []
+                rows.extend(table)
+                if total is None:
+                    try:
+                        total = int((data.get("Table1") or [{}])[0].get("ROWCNT") or 0)
+                    except Exception:
+                        total = None
+                if not table: break
+                params["pageno"] += 1; page += 1; time.sleep(0.25)
+                if total and len(rows) >= total: break
+
+            if rows:
+                # mimic original "first variant that yields rows" per day
+                day_rows = rows
                 break
-            data = r.json()
-            table = data.get("Table") or []
-            rows.extend(table)
-            if total is None:
-                try: total = int((data.get("Table1") or [{}])[0].get("ROWCNT") or 0)
-                except Exception: total = None
-            if not table: break
-            params["pageno"] += 1; page += 1; time.sleep(0.25)
-            if total and len(rows) >= total: break
-        if rows:
-            all_rows = rows; break
 
-    if not all_rows: return pd.DataFrame()
+        # append whatever we got for this day (no deduplication)
+        if day_rows:
+            all_rows.extend(day_rows)
 
-    # Build DF
+        cur += timedelta(days=1)
+
+    if not all_rows:
+        return pd.DataFrame()
+
     all_keys = set()
     for r in all_rows: all_keys.update(r.keys())
     df = pd.DataFrame(all_rows, columns=list(all_keys))
 
-    # Filter: Company Update + M&A/Merger/Scheme/JV in subcategory fields
+    # --- original filtering remains unchanged ---
     def filter_announcements(df_in: pd.DataFrame, category_filter="Company Update") -> pd.DataFrame:
         if df_in.empty: return df_in.copy()
         cat_col = _first_col(df_in, ["CATEGORYNAME","CATEGORY","NEWS_CAT","NEWSCATEGORY","NEWS_CATEGORY"])
@@ -319,6 +348,7 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
         .any(axis=1)
     ]
     return df_filtered
+
 
 # =========================================
 # NLP Summarizer (non-LLM)
