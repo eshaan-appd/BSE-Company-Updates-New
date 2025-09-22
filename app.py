@@ -18,20 +18,15 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 with st.expander("🔍 OpenAI connection diagnostics", expanded=False):
-    # 1) Is the key visible?
     key_src = "st.secrets" if "OPENAI_API_KEY" in st.secrets else "env"
     mask = lambda s: (s[:7] + "..." + s[-4:]) if s and len(s) > 12 else "unset"
     st.write("Key source:", key_src)
     st.write("API key (masked):", mask(st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")))
-
-    # 2) Can we list models? (auth + project/perm sanity)
     try:
         _ = client.models.list()
         st.success("Models list ok — auth + project look good.")
     except Exception as e:
         st.error(f"Models list failed: {e}")
-
-    # 3) Can we call a tiny Responses echo? (billing/quota often shows up here)
     try:
         r = client.responses.create(model="gpt-4.1-mini", input="ping")
         st.success("Responses call ok.")
@@ -60,12 +55,33 @@ def _first_col(df: pd.DataFrame, names):
 def _norm(s):
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
+def _key(s: str) -> str:
+    return _norm(s).lower()
+
 def _slug(s: str, maxlen: int = 60) -> str:
     s = re.sub(r"[^A-Za-z0-9]+", "_", str(s or "")).strip("_")
     return (s[:maxlen] if len(s) > maxlen else s) or "file"
 
 def _fmt(d: datetime.date) -> str:
     return d.strftime("%Y%m%d")
+
+def _df_to_excel_bytes(df: pd.DataFrame) -> bytes | None:
+    """
+    Return XLSX bytes if possible; None if engines unavailable.
+    """
+    try:
+        bio = io.BytesIO()
+        try:
+            with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
+                df.to_excel(writer, index=False, sheet_name="Data")
+        except Exception:
+            # fall back to default engine (e.g., openpyxl)
+            with pd.ExcelWriter(bio) as writer:
+                df.to_excel(writer, index=False, sheet_name="Data")
+        bio.seek(0)
+        return bio.getvalue()
+    except Exception:
+        return None
 
 # --- classify & prompts -------------------------------------------------
 def _lower_join(*parts) -> str:
@@ -222,7 +238,7 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
         for v in variants:
             params = {
                 "pageno": 1, "strCat": "-1", "subcategory": v["subcategory"],
-                "strPrevDate": day_str, "strToDate": day_str,  # per-day window
+                "strPrevDate": day_str, "strToDate": day_str,
                 "strSearch": v["strSearch"], "strscrip": "", "strType": "C",
             }
             rows, total, page = [], None, 1
@@ -248,7 +264,6 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
                 params["pageno"] += 1; page += 1; time.sleep(0.25)
                 if total and len(rows) >= total: break
             if rows:
-                # first variant with rows for that day
                 day_rows = rows
                 break
         if day_rows:
@@ -261,7 +276,7 @@ def fetch_bse_announcements_strict(start_yyyymmdd: str,
     all_keys = set()
     for r in all_rows: all_keys.update(r.keys())
     df = pd.DataFrame(all_rows, columns=list(all_keys))
-    return df  # no filtering here
+    return df
 
 # =========================================
 # OpenAI PDF summarization
@@ -292,12 +307,7 @@ def _upload_to_openai(pdf_bytes: bytes, fname: str = "document.pdf"):
 def summarize_pdf_with_openai(pdf_bytes: bytes, company: str, headline: str, subcat: str,
                               model: str = "gpt-4.1-mini", style: str = "bullets", max_output_tokens: int = 800,
                               temperature: float = 0.2, task_override: str | None = None) -> str:
-    """
-    Uses the Responses API with a file attachment. The model reads the PDF and returns a summary.
-    Accepts an optional task_override prompt for context-specific extraction.
-    """
     f = _upload_to_openai(pdf_bytes, fname=f"{_slug(company or 'doc')}.pdf")
-
     task = task_override or f"""
 You are an M&A analyst. Read the attached PDF (BSE filing).
 Company: {company or 'NA'}
@@ -322,7 +332,6 @@ If data is not present, explicitly say "Not disclosed" rather than guessing.
     )
     return (resp.output_text or "").strip()
 
-# Simple rate-limit friendly wrapper
 def safe_summarize(*args, **kwargs) -> str:
     for i in range(4):
         try:
@@ -363,7 +372,6 @@ with st.sidebar:
 # Run pipeline (fetch → user dropdown filters → PDFs → OpenAI summaries)
 # =========================================
 def _pick_cols(df: pd.DataFrame):
-    # (kept as before; may return names that aren't present — guarded below)
     nm = _first_col(df, ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME"
     subcol = _first_col(df, ["SUBCATEGORYNAME","SUBCATEGORY","SUB_CATEGORY","NEWS_SUBCATEGORY","NEWS_SUB"]) or "SUBCATEGORYNAME"
     catcol = _first_col(df, ["CATEGORYNAME","CATEGORY","NEWS_CAT","NEWSCATEGORY","NEWS_CATEGORY"])
@@ -376,6 +384,8 @@ if "sel_cats" not in st.session_state:
     st.session_state["sel_cats"] = []
 if "sel_subs" not in st.session_state:
     st.session_state["sel_subs"] = []
+if "prev_sel_cats" not in st.session_state:
+    st.session_state["prev_sel_cats"] = []
 
 if run:
     if not os.getenv("OPENAI_API_KEY"):
@@ -399,56 +409,81 @@ else:
 
     nm, subcol, catcol = _pick_cols(df_hits)
 
-    # ---------------------- PATCH 2 (guarded dependent dropdowns) ----------------------
-    # 1) Category options from full dataset (guarded)
+    # 1) Category options (normalized, guarded)
     if catcol and catcol in df_hits.columns:
-        cats_all = sorted(df_hits[catcol].dropna().astype(str).map(_norm).unique())
+        cats_all_keys = sorted(df_hits[catcol].astype(str).map(_key).dropna().unique())
     else:
-        cats_all = []
+        cats_all_keys = []
         st.info("No Category column detected in the fetched data.", icon="ℹ️")
 
     sel_cats = st.multiselect(
         "Category (leave blank for all)",
-        options=cats_all,
-        default=st.session_state.get("sel_cats", []),
+        options=cats_all_keys,
+        default=[c for c in st.session_state.get("sel_cats", []) if c in cats_all_keys],
         key="sel_cats"
     )
 
-    # 2) Build subcategory options *after* applying the category filter (guarded)
+    # Reset subs if categories changed
+    if st.session_state["prev_sel_cats"] != sel_cats:
+        st.session_state["sel_subs"] = []
+    st.session_state["prev_sel_cats"] = sel_cats
+
+    # 2) Subcategory options derived AFTER category filter
     df_for_subs = df_hits.copy()
     if catcol and catcol in df_for_subs.columns and sel_cats:
-        df_for_subs["_cat_norm"] = df_for_subs[catcol].astype(str).map(_norm)
-        df_for_subs = df_for_subs[df_for_subs["_cat_norm"].isin(set(sel_cats))].drop(columns=["_cat_norm"])
+        df_for_subs["_cat_key"] = df_for_subs[catcol].astype(str).map(_key)
+        df_for_subs = df_for_subs[df_for_subs["_cat_key"].isin(sel_cats)].drop(columns=["_cat_key"])
 
-    if subcol and (subcol in df_for_subs.columns):
-        subs_filtered = sorted(df_for_subs[subcol].dropna().astype(str).map(_norm).unique())
+    if subcol and subcol in df_for_subs.columns:
+        subs_filtered_keys = sorted(df_for_subs[subcol].astype(str).map(_key).dropna().unique())
     else:
-        subs_filtered = []
+        subs_filtered_keys = []
         st.info("No Subcategory column detected in the fetched data (or none after Category filter).", icon="ℹ️")
-
-    # Keep only valid previously selected subs when options shrink
-    default_subs = [s for s in st.session_state.get("sel_subs", []) if s in subs_filtered]
 
     sel_subs = st.multiselect(
         "Subcategory (leave blank for all)",
-        options=subs_filtered,
-        default=default_subs,
+        options=subs_filtered_keys,
+        default=[s for s in st.session_state.get("sel_subs", []) if s in subs_filtered_keys],
         key="sel_subs",
         help="Options refresh based on chosen Category."
     )
 
-    # 3) Apply both filters (guarded)
+    # 3) Apply both filters (normalized)
     df_filtered = df_hits.copy()
+
     if catcol and catcol in df_filtered.columns and sel_cats:
-        df_filtered["_cat_norm"] = df_filtered[catcol].astype(str).map(_norm)
-        df_filtered = df_filtered[df_filtered["_cat_norm"].isin(set(sel_cats))].drop(columns=["_cat_norm"])
+        df_filtered["_cat_key"] = df_filtered[catcol].astype(str).map(_key)
+        df_filtered = df_filtered[df_filtered["_cat_key"].isin(sel_cats)].drop(columns=["_cat_key"])
 
     if subcol and subcol in df_filtered.columns and sel_subs:
-        df_filtered["_sub_norm"] = df_filtered[subcol].astype(str).map(_norm)
-        df_filtered = df_filtered[df_filtered["_sub_norm"].isin(set(sel_subs))].drop(columns=["_sub_norm"])
-    # ---------------------- END PATCH 2 ----------------------
+        df_filtered["_sub_key"] = df_filtered[subcol].astype(str).map(_key)
+        df_filtered = df_filtered[df_filtered["_sub_key"].isin(sel_subs)].drop(columns=["_sub_key"])
 
     st.write(f"After filters: **{len(df_filtered)}** rows")
+
+    # --- Download buttons (Excel + CSV) ---
+    col_dl1, col_dl2 = st.columns([1,1])
+    with col_dl1:
+        xbytes = _df_to_excel_bytes(df_filtered)
+        if xbytes is not None:
+            st.download_button(
+                "⬇️ Download filtered table (Excel)",
+                data=xbytes,
+                file_name=f"bse_filtered_{_fmt(start_date)}_{_fmt(end_date)}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        else:
+            st.warning("Excel writer not available. Use CSV download instead.", icon="⚠️")
+    with col_dl2:
+        st.download_button(
+            "⬇️ Download filtered table (CSV)",
+            data=df_filtered.to_csv(index=False).encode("utf-8"),
+            file_name=f"bse_filtered_{_fmt(start_date)}_{_fmt(end_date)}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
     st.dataframe(df_filtered.head(50), use_container_width=True)
 
     summarize_btn = st.button("🧠 Step 3: Apply filters & Summarize", type="secondary")
@@ -482,9 +517,9 @@ else:
             if not pdf_bytes:
                 return idx, used_url, "⚠️ Could not fetch a valid PDF.", None
 
-            company = str(row.get(nm) or "").strip()
+            company = str(row.get(_first_col(df_hits, ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME") or "").strip()
             headline = str(row.get("HEADLINE") or "").strip()
-            subcat_val = str(row.get(subcol) or "").strip()
+            subcat_val = str(row.get(subcol) or "").strip() if subcol else ""
             category_val = str(row.get(catcol) or "").strip() if catcol else ""
 
             kind = classify_announcement(category_val, subcat_val, headline)
@@ -505,9 +540,9 @@ else:
             for fut in as_completed(futs):
                 i, pdf_url, summary, kind = fut.result()
                 r = rows[i][0]
-                company = str(r.get(nm) or "").strip()
+                company = str(r.get(_first_col(df_hits, ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME") or "").strip()
                 dt = str(r.get("NEWS_DT") or "").strip()
-                subcat_val = str(r.get(subcol) or "").strip()
+                subcat_val = str(r.get(subcol) or "").strip() if subcol else ""
                 headline = str(r.get("HEADLINE") or "").strip()
 
                 badge = {"order": "🟦 Order book", "capex": "🟧 Capex", "result": "🟩 Results", "special": "⬜ Special"}[kind]
