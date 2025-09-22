@@ -10,3 +10,5 @@ pytesseract
 numpy
 scikit-learn
 openai>=1.0.0
+XlsxWriter>=3.1.0   
+openpyxl>=3.1.2    
