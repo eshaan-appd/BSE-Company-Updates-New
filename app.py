@@ -67,7 +67,7 @@ def _slug(s: str, maxlen: int = 60) -> str:
 def _fmt(d: datetime.date) -> str:
     return d.strftime("%Y%m%d")
 
-# --- NEW: classify & prompts -------------------------------------------------
+# --- classify & prompts -------------------------------------------------
 def _lower_join(*parts) -> str:
     return " ".join([str(p or "") for p in parts]).lower()
 
@@ -363,6 +363,7 @@ with st.sidebar:
 # Run pipeline (fetch → user dropdown filters → PDFs → OpenAI summaries)
 # =========================================
 def _pick_cols(df: pd.DataFrame):
+    # (kept as before; may return names that aren't present — guarded below)
     nm = _first_col(df, ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME"
     subcol = _first_col(df, ["SUBCATEGORYNAME","SUBCATEGORY","SUB_CATEGORY","NEWS_SUBCATEGORY","NEWS_SUB"]) or "SUBCATEGORYNAME"
     catcol = _first_col(df, ["CATEGORYNAME","CATEGORY","NEWS_CAT","NEWSCATEGORY","NEWS_CATEGORY"])
@@ -398,10 +399,14 @@ else:
 
     nm, subcol, catcol = _pick_cols(df_hits)
 
-    # Category options from full dataset
-    cats_all = sorted(df_hits[catcol].dropna().astype(str).map(_norm).unique()) if catcol else []
+    # ---------------------- PATCH 2 (guarded dependent dropdowns) ----------------------
+    # 1) Category options from full dataset (guarded)
+    if catcol and catcol in df_hits.columns:
+        cats_all = sorted(df_hits[catcol].dropna().astype(str).map(_norm).unique())
+    else:
+        cats_all = []
+        st.info("No Category column detected in the fetched data.", icon="ℹ️")
 
-    # Category multiselect
     sel_cats = st.multiselect(
         "Category (leave blank for all)",
         options=cats_all,
@@ -409,32 +414,39 @@ else:
         key="sel_cats"
     )
 
-    # Subcategory options depend on category selection
+    # 2) Build subcategory options *after* applying the category filter (guarded)
     df_for_subs = df_hits.copy()
-    if catcol and sel_cats:
+    if catcol and catcol in df_for_subs.columns and sel_cats:
         df_for_subs["_cat_norm"] = df_for_subs[catcol].astype(str).map(_norm)
         df_for_subs = df_for_subs[df_for_subs["_cat_norm"].isin(set(sel_cats))].drop(columns=["_cat_norm"])
 
-    subs_filtered = sorted(
-        df_for_subs[subcol].dropna().astype(str).map(_norm).unique()
-    ) if subcol and not df_for_subs.empty else []
+    if subcol and (subcol in df_for_subs.columns):
+        subs_filtered = sorted(df_for_subs[subcol].dropna().astype(str).map(_norm).unique())
+    else:
+        subs_filtered = []
+        st.info("No Subcategory column detected in the fetched data (or none after Category filter).", icon="ℹ️")
+
+    # Keep only valid previously selected subs when options shrink
+    default_subs = [s for s in st.session_state.get("sel_subs", []) if s in subs_filtered]
 
     sel_subs = st.multiselect(
         "Subcategory (leave blank for all)",
         options=subs_filtered,
-        default=[s for s in st.session_state.get("sel_subs", []) if s in subs_filtered],
+        default=default_subs,
         key="sel_subs",
         help="Options refresh based on chosen Category."
     )
 
-    # Apply filters to the dataset
+    # 3) Apply both filters (guarded)
     df_filtered = df_hits.copy()
-    if catcol and sel_cats:
+    if catcol and catcol in df_filtered.columns and sel_cats:
         df_filtered["_cat_norm"] = df_filtered[catcol].astype(str).map(_norm)
         df_filtered = df_filtered[df_filtered["_cat_norm"].isin(set(sel_cats))].drop(columns=["_cat_norm"])
-    if subcol and sel_subs:
+
+    if subcol and subcol in df_filtered.columns and sel_subs:
         df_filtered["_sub_norm"] = df_filtered[subcol].astype(str).map(_norm)
         df_filtered = df_filtered[df_filtered["_sub_norm"].isin(set(sel_subs))].drop(columns=["_sub_norm"])
+    # ---------------------- END PATCH 2 ----------------------
 
     st.write(f"After filters: **{len(df_filtered)}** rows")
     st.dataframe(df_filtered.head(50), use_container_width=True)
