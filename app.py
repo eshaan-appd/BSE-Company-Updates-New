@@ -66,22 +66,25 @@ def _fmt(d: datetime.date) -> str:
     return d.strftime("%Y%m%d")
 
 def _df_to_excel_bytes(df: pd.DataFrame) -> bytes | None:
-    """
-    Return XLSX bytes if possible; None if engines unavailable.
-    """
     try:
         bio = io.BytesIO()
         try:
             with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
                 df.to_excel(writer, index=False, sheet_name="Data")
         except Exception:
-            # fall back to default engine (e.g., openpyxl)
             with pd.ExcelWriter(bio) as writer:
                 df.to_excel(writer, index=False, sheet_name="Data")
         bio.seek(0)
         return bio.getvalue()
     except Exception:
         return None
+
+def _to_code_str(x) -> str:
+    """Normalize SCRIP_CD-like values to clean string codes (e.g., '532540' not '532540.0')."""
+    s = str(x).strip()
+    if re.fullmatch(r"\d+\.0", s):  # e.g., '532540.0'
+        return s[:-2]
+    return s
 
 # --- classify & prompts -------------------------------------------------
 def _lower_join(*parts) -> str:
@@ -375,7 +378,8 @@ def _pick_cols(df: pd.DataFrame):
     nm = _first_col(df, ["SLONGNAME","SNAME","SC_NAME","COMPANYNAME"]) or "SLONGNAME"
     subcol = _first_col(df, ["SUBCATEGORYNAME","SUBCATEGORY","SUB_CATEGORY","NEWS_SUBCATEGORY","NEWS_SUB"]) or "SUBCATEGORYNAME"
     catcol = _first_col(df, ["CATEGORYNAME","CATEGORY","NEWS_CAT","NEWSCATEGORY","NEWS_CATEGORY"])
-    return nm, subcol, catcol
+    scripcol = _first_col(df, ["SCRIP_CD","SC_CODE","SCRIP_CODE","SCRIPID","SC_CODE"])
+    return nm, subcol, catcol, scripcol
 
 # Session state for persistence
 if "latest_df" not in st.session_state:
@@ -384,8 +388,12 @@ if "sel_cats" not in st.session_state:
     st.session_state["sel_cats"] = []
 if "sel_subs" not in st.session_state:
     st.session_state["sel_subs"] = []
+if "sel_scrips" not in st.session_state:
+    st.session_state["sel_scrips"] = []
 if "prev_sel_cats" not in st.session_state:
     st.session_state["prev_sel_cats"] = []
+if "prev_sel_subs" not in st.session_state:
+    st.session_state["prev_sel_subs"] = []
 
 if run:
     if not os.getenv("OPENAI_API_KEY"):
@@ -403,11 +411,11 @@ if run:
 df_hits = st.session_state["latest_df"]
 
 if df_hits.empty:
-    st.info("Pick your date range and click **Step 1: Fetch announcements**. Then choose Category/Subcategory and summarize.")
+    st.info("Pick your date range and click **Step 1: Fetch announcements**. Then choose Category/Subcategory/Scrip and summarize.")
 else:
     st.subheader("🔎 Step 2: Choose filters")
 
-    nm, subcol, catcol = _pick_cols(df_hits)
+    nm, subcol, catcol, scripcol = _pick_cols(df_hits)
 
     # 1) Category options (normalized, guarded)
     if catcol and catcol in df_hits.columns:
@@ -423,9 +431,10 @@ else:
         key="sel_cats"
     )
 
-    # Reset subs if categories changed
+    # Reset subs/scrips if categories changed
     if st.session_state["prev_sel_cats"] != sel_cats:
         st.session_state["sel_subs"] = []
+        st.session_state["sel_scrips"] = []
     st.session_state["prev_sel_cats"] = sel_cats
 
     # 2) Subcategory options derived AFTER category filter
@@ -448,7 +457,47 @@ else:
         help="Options refresh based on chosen Category."
     )
 
-    # 3) Apply both filters (normalized)
+    # Reset scrips if subcategories changed
+    if st.session_state["prev_sel_subs"] != sel_subs:
+        st.session_state["sel_scrips"] = []
+    st.session_state["prev_sel_subs"] = sel_subs
+
+    # 3) Scrip options derived AFTER category & subcategory filters
+    df_for_scrips = df_for_subs.copy()
+    if subcol and subcol in df_for_scrips.columns and sel_subs:
+        df_for_scrips["_sub_key"] = df_for_scrips[subcol].astype(str).map(_key)
+        df_for_scrips = df_for_scrips[df_for_scrips["_sub_key"].isin(sel_subs)].drop(columns=["_sub_key"])
+
+    if scripcol and scripcol in df_for_scrips.columns:
+        # Build pretty labels "CODE — COMPANY" but filter by CODE
+        code_series = df_for_scrips[scripcol].astype(str).map(_to_code_str)
+        name_col = nm if nm in df_for_scrips.columns else None
+        if name_col:
+            names = df_for_scrips[name_col].astype(str).fillna("")
+        else:
+            names = pd.Series([""] * len(code_series), index=df_for_scrips.index)
+
+        # Deduplicate by code, keep first name occurrence
+        pairs = pd.DataFrame({"code": code_series, "name": names}).drop_duplicates(subset=["code"])
+        scrip_labels = sorted((pairs["code"] + " — " + pairs["name"]).str.strip().unique())
+    else:
+        scrip_labels = []
+        st.info("No SCRIP_CD column detected in the fetched data (or none after prior filters).", icon="ℹ️")
+
+    def _label_to_code(lbl: str) -> str:
+        return lbl.split(" — ", 1)[0].strip()
+
+    sel_scrip_labels = st.multiselect(
+        "Scrip (from SCRIP_CD; leave blank for all)",
+        options=scrip_labels,
+        default=[lab for lab in st.session_state.get("sel_scrips", []) if lab in scrip_labels],
+        key="sel_scrips",
+        help="Type to search. Values come from SCRIP_CD; label shows code and company."
+    )
+
+    sel_scrip_codes = {_label_to_code(l) for l in sel_scrip_labels}
+
+    # 4) Apply all filters (normalized for cat/sub; code-normalized for scrip)
     df_filtered = df_hits.copy()
 
     if catcol and catcol in df_filtered.columns and sel_cats:
@@ -458,6 +507,10 @@ else:
     if subcol and subcol in df_filtered.columns and sel_subs:
         df_filtered["_sub_key"] = df_filtered[subcol].astype(str).map(_key)
         df_filtered = df_filtered[df_filtered["_sub_key"].isin(sel_subs)].drop(columns=["_sub_key"])
+
+    if scripcol and scripcol in df_filtered.columns and sel_scrip_codes:
+        df_filtered["_code_key"] = df_filtered[scripcol].astype(str).map(_to_code_str)
+        df_filtered = df_filtered[df_filtered["_code_key"].isin(sel_scrip_codes)].drop(columns=["_code_key"])
 
     st.write(f"After filters: **{len(df_filtered)}** rows")
 
@@ -474,7 +527,7 @@ else:
                 use_container_width=True
             )
         else:
-            st.warning("Excel writer not available. Use CSV download instead.", icon="⚠️")
+            st.warning("Excel writer not available. Using CSV instead.", icon="⚠️")
     with col_dl2:
         st.download_button(
             "⬇️ Download filtered table (CSV)",
@@ -504,7 +557,6 @@ else:
         st.subheader("📑 Summaries (OpenAI)")
 
         def worker(idx, row, urls):
-            # try urls in order until one downloads
             pdf_bytes, used_url = None, ""
             for u in urls:
                 try:
